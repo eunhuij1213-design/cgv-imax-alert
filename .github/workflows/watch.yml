@@ -31,6 +31,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # CGV 는 Cloudflare 가 TLS 지문을 검사해서 일반 HTTP 클라이언트를 403 으로 막는다.
+      # curl_cffi 의 Chrome 임퍼소네이션이 있어야 CGV 소스를 쓸 수 있다.
+      # (설치가 실패해도 네이버 소스만으로 감시는 계속된다)
+      - name: curl_cffi 설치
+        continue-on-error: true
+        run: pip install --disable-pip-version-check curl_cffi
+
       - name: 예매 오픈 확인
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -38,12 +45,13 @@ jobs:
           POLL_SECONDS: "270"
           POLL_INTERVAL: "30"
           # 감시 대상 — 다른 영화/극장으로 바꾸려면 여기만 수정한다.
-          PLACE_ID: "12298207"      # 네이버 플레이스: CGV 용산아이파크몰
           WATCH_FROM: "2026-08-19"  # 이 날짜 이후가 열리면 알림
           MOVIE_NO: "30001323"      # CGV 영화코드: 오디세이
           MOVIE_NAME: "오디세이"
+          SITE_NO: "0013"           # CGV 극장코드: 용산아이파크몰
           SCREEN_NO: "018"          # 용산 IMAX관
           SCREEN_NAME: "IMAX"
+          PLACE_ID: "12298207"      # 네이버 플레이스: CGV 용산아이파크몰
         run: python check.py
 
       - name: 상태 저장 (중복 알림 방지)

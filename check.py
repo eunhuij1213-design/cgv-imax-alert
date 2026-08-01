@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""CGV 용산아이파크몰 IMAX 예매 오픈 감시기.
+"""CGV 용산아이파크몰 IMAX 예매 오픈 감시기 — 이중 소스.
 
-네이버 플레이스의 극장 상영시간표 페이지를 읽어 '예매 가능한 날짜' 목록을 뽑는다.
-WATCH_FROM 이후 날짜가 목록에 나타나면 = 그 날짜 예매가 열린 것이므로 ntfy로 푸시를 보낸다.
+두 곳을 독립적으로 확인하고, 둘 중 **하나라도** 새 날짜를 발견하면 ntfy로 푸시를 보낸다.
 
-CGV 본사이트(cgv.co.kr)는 Cloudflare + 자체 봇 차단으로 서버에서 접근이 불가능하다.
-(일반 HTTP 클라이언트 403, 헤드리스 크로미움도 "비정상적으로 접속" 차단)
-네이버 플레이스는 같은 데이터를 서버 렌더링으로 내려주고 차단이 없어서 이쪽을 쓴다.
+  1차: CGV 공식 BFF API (cgv.co.kr/api/v1/booking/*)
+       가장 빠르고 정확하다. 회차별 잔여 좌석 수까지 나온다.
+       주의: `www.cgv.co.kr` 은 봇 차단으로 SPA 껍데기만 주고, `www` 없는 아펙스
+       도메인 `cgv.co.kr` 만 실제 JSON 을 준다. 또 Cloudflare 가 TLS 지문을 보므로
+       curl_cffi 의 Chrome 임퍼소네이션이 필요하다(일반 urllib 은 403).
 
-의존성 없음 — 파이썬 표준 라이브러리만 사용한다.
+  2차: 네이버 플레이스 극장 상영시간표 (표준 라이브러리만으로 접근 가능)
+       CGV 쪽이 차단되거나 스펙이 바뀌어도 감시가 이어지도록 하는 백업이다.
+
+한쪽이 죽어도 다른 쪽으로 계속 감시한다. 둘 다 죽으면 경고 알림을 보낸다.
 """
 
 from __future__ import annotations
@@ -23,16 +27,27 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+
+try:
+    from curl_cffi import requests as cffi
+except ImportError:  # 네이버 소스만으로도 동작해야 한다
+    cffi = None
 
 KST = timezone(timedelta(hours=9))
 
 # ---------------------------------------------------------------- 설정
-PLACE_ID = os.environ.get("PLACE_ID", "12298207")          # 네이버 플레이스: CGV 용산아이파크몰
-WATCH_FROM = os.environ.get("WATCH_FROM", "2026-08-19")     # 이 날짜(포함) 이후가 열리면 알림
-MOVIE_NO = os.environ.get("MOVIE_NO", "30001323")           # CGV 영화코드: 오디세이
+WATCH_FROM = os.environ.get("WATCH_FROM", "2026-08-19")   # 이 날짜(포함) 이후가 열리면 알림
+
+CO_CD = os.environ.get("CO_CD", "A420")                   # CGV 회사코드
+SITE_NO = os.environ.get("SITE_NO", "0013")               # CGV 극장코드: 용산아이파크몰
+MOVIE_NO = os.environ.get("MOVIE_NO", "30001323")         # CGV 영화코드: 오디세이
+SCREEN_NO = os.environ.get("SCREEN_NO", "018")            # 용산 IMAX관 상영관 번호
+SCREEN_GRADE = os.environ.get("SCREEN_GRADE", "아이맥스")  # 특별관 등급명 (SCREEN_NO 백업 판정)
+
+PLACE_ID = os.environ.get("PLACE_ID", "12298207")         # 네이버 플레이스: CGV 용산아이파크몰
+
 MOVIE_NAME = os.environ.get("MOVIE_NAME", "오디세이")
-SCREEN_NO = os.environ.get("SCREEN_NO", "018")              # 용산 IMAX관 상영관 번호
 SCREEN_NAME = os.environ.get("SCREEN_NAME", "IMAX")
 
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -40,9 +55,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 
-BOOKING_URL = (
-    "https://cgv.co.kr/cnm/movieBook/cinema?siteNo=0013"
-)
+CGV_API = "https://cgv.co.kr/api/v1/booking"
+BOOKING_URL = f"https://cgv.co.kr/cnm/movieBook/cinema?siteNo={SITE_NO}"
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
@@ -53,17 +67,18 @@ def log(msg: str) -> None:
     print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S KST}] {msg}", flush=True)
 
 
-def fetch(url: str, timeout: int = 30) -> str:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Accept-Encoding": "gzip",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    return raw.decode("utf-8", "replace")
+def ymd_to_iso(ymd: str) -> str:
+    return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+
+def iso_to_ymd(iso: str) -> str:
+    return iso.replace("-", "")
+
+
+def hhmm(raw: str) -> str:
+    """'0630' -> '06:30'"""
+    raw = (raw or "").strip()
+    return f"{raw[:2]}:{raw[2:]}" if len(raw) == 4 else raw
 
 
 def load_state() -> dict:
@@ -80,31 +95,85 @@ def save_state(state: dict) -> None:
         f.write("\n")
 
 
-# ---------------------------------------------------------------- 파싱
-def theater_url(day: str) -> str:
-    return f"https://m.place.naver.com/place/{PLACE_ID}/movie?datefilter={day}"
+# ---------------------------------------------------------------- 소스 1: CGV 공식 API
+def cgv_get(endpoint: str, **params) -> list | dict:
+    if cffi is None:
+        raise RuntimeError("curl_cffi 가 없어 CGV API 를 호출할 수 없다")
+    # Cloudflare 가 TLS 지문을 검사하므로 Chrome 을 흉내낸다.
+    s = cffi.Session(impersonate="chrome")
+    r = s.get(f"{CGV_API}/{endpoint}", params=params, timeout=25, headers={
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR",
+        "Referer": "https://www.cgv.co.kr/cnm/movieBook",
+    })
+    body = r.json()
+    if body.get("statusCode") not in (0, "0"):
+        raise RuntimeError(f"{endpoint}: {body.get('statusMessage')}")
+    return body.get("data") or []
 
 
-def parse_bookable_dates(html: str) -> list[str]:
-    """상단 날짜 탭에 노출되는 = 예매가 열린 날짜 목록."""
-    pat = rf"/theater/{PLACE_ID}/movie\?datefilter=(\d{{4}}-\d{{2}}-\d{{2}})"
-    return sorted(set(re.findall(pat, html)))
+def cgv_open_dates() -> set[str]:
+    """대상 영화가 이 극장에서 예매 가능한 날짜."""
+    rows = cgv_get("searchSiteScnscYmdListByMov",
+                   coCd=CO_CD, siteNo=SITE_NO, movNo=MOVIE_NO)
+    dates = {ymd_to_iso(r["scnYmd"]) for r in rows if r.get("scnYmd")}
+    if not dates:
+        # 상영 중인 영화인데 날짜가 0건이면 정상이 아니다(코드 변경·스펙 변경 의심).
+        # 조용히 "열린 날짜 없음"으로 넘기면 고장을 못 잡으므로 실패로 다룬다.
+        raise RuntimeError("예매 가능 날짜가 0건 (영화·극장 코드 또는 스펙 변경 의심)")
+    return dates
 
 
-def parse_showtimes(html: str) -> list[dict]:
-    """예매 링크에서 (영화코드, 날짜, 상영관번호, 시각)을 뽑는다."""
-    pat = (r'href="https://cgv\.co\.kr/cnm/movieBook/movie\?movNo=(\d+)&amp;scnYmd=(\d{8})'
-           r'[^"]*?scnsNo=(\d+)[^"]*"[^>]*>(\d{1,2}:\d{2})<')
+def cgv_showtimes(date_iso: str) -> list[str]:
+    """해당 날짜의 대상 영화 × 대상 상영관 회차. 잔여 좌석까지 붙인다."""
+    rows = cgv_get("searchSchByMov", coCd=CO_CD, siteNo=SITE_NO, movNo=MOVIE_NO,
+                   scnYmd=iso_to_ymd(date_iso), rtctlScopCd="1")
     out = []
-    for mov_no, ymd, scns_no, hhmm in re.findall(pat, html):
-        out.append({"movNo": mov_no, "date": ymd, "screenNo": scns_no, "time": hhmm})
+    for r in rows:
+        if r.get("scnsNo") != SCREEN_NO and r.get("tcscnsGradNm") != SCREEN_GRADE:
+            continue
+        seats = ""
+        free, total = r.get("frSeatCnt"), r.get("stcnt")
+        if free is not None and total is not None:
+            seats = f" (잔여 {free}/{total}석)"
+        out.append(f"{hhmm(r.get('scnsrtTm'))}{seats}")
     return out
 
 
-def target_showtimes(html: str) -> list[str]:
-    """해당 날짜의 대상 영화 × 대상 상영관 회차 시각."""
-    return [s["time"] for s in parse_showtimes(html)
-            if s["movNo"] == MOVIE_NO and s["screenNo"] == SCREEN_NO]
+# ---------------------------------------------------------------- 소스 2: 네이버 플레이스
+def naver_fetch(url: str, timeout: int = 30) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return raw.decode("utf-8", "replace")
+
+
+def naver_url(date_iso: str) -> str:
+    return f"https://m.place.naver.com/place/{PLACE_ID}/movie?datefilter={date_iso}"
+
+
+def naver_open_dates() -> set[str]:
+    """상단 날짜 탭 = 예매가 열린 날짜."""
+    html = naver_fetch(naver_url(datetime.now(KST).date().isoformat()))
+    pat = rf"/theater/{PLACE_ID}/movie\?datefilter=(\d{{4}}-\d{{2}}-\d{{2}})"
+    dates = set(re.findall(pat, html))
+    if not dates:
+        raise RuntimeError("날짜 탭을 파싱하지 못했다 (페이지 구조 변경 의심)")
+    return dates
+
+
+def naver_showtimes(date_iso: str) -> list[str]:
+    html = naver_fetch(naver_url(date_iso))
+    pat = (r'href="https://cgv\.co\.kr/cnm/movieBook/movie\?movNo=(\d+)&amp;scnYmd=(\d{8})'
+           r'[^"]*?scnsNo=(\d+)[^"]*"[^>]*>(\d{1,2}:\d{2})<')
+    return [t for mov, _, scns, t in re.findall(pat, html)
+            if mov == MOVIE_NO and scns == SCREEN_NO]
 
 
 # ---------------------------------------------------------------- 알림
@@ -137,47 +206,75 @@ def notify(title: str, body: str, *, priority: str = "urgent",
 
 
 # ---------------------------------------------------------------- 본체
+SOURCES = [
+    ("CGV", cgv_open_dates, cgv_showtimes),
+    ("네이버", naver_open_dates, naver_showtimes),
+]
+
+
 def run_once(state: dict) -> bool:
     """한 번 검사한다. 상태가 바뀌었으면 True."""
     today = datetime.now(KST).date().isoformat()
-    html = fetch(theater_url(today))
-    dates = parse_bookable_dates(html)
+    found: dict[str, set[str]] = {}   # 소스명 -> 열린 날짜
+    failures: dict[str, str] = {}
 
-    if not dates:
-        # 페이지 구조가 바뀌었거나 차단된 경우. 하루 한 번만 경고한다.
-        log("경고: 날짜 목록을 파싱하지 못했다.")
+    for name, list_dates, _ in SOURCES:
+        try:
+            dates = list_dates()
+            found[name] = dates
+            log(f"{name}: 예매 가능 {len(dates)}건 (최대 {max(dates)})")
+        except Exception as e:
+            failures[name] = str(e)
+            log(f"{name}: 조회 실패 — {e}")
+
+    if not found:
+        # 두 소스가 동시에 죽었다. 하루 한 번만 경고한다.
+        log("경고: 모든 소스 조회 실패")
         if state.get("broken_notified_on") != today:
+            detail = "\n".join(f"• {k}: {v}" for k, v in failures.items())
             notify("⚠️ CGV 감시기 점검 필요",
-                   "네이버 플레이스에서 상영 날짜 목록을 읽지 못했습니다.\n"
-                   "페이지 구조가 바뀌었을 수 있습니다.",
-                   priority="default", tags="warning",
-                   click=theater_url(today))
+                   f"두 소스 모두 조회에 실패했습니다.\n\n{detail}",
+                   priority="default", tags="warning", click=BOOKING_URL)
             state["broken_notified_on"] = today
             return True
         return False
 
     state.pop("broken_notified_on", None)
-    log(f"예매 가능 날짜 {len(dates)}건: {dates[0]} ~ {dates[-1]}")
+    state["source_status"] = {name: ("ok" if name in found else failures.get(name, "fail"))
+                              for name, _, _ in SOURCES}
 
-    new_dates = [d for d in dates
-                 if d >= WATCH_FROM and d not in state.get("notified_dates", [])]
+    already = set(state.get("notified_dates", []))
+    new_by_source = {name: sorted(d for d in dates if d >= WATCH_FROM and d not in already)
+                     for name, dates in found.items()}
+    new_dates = sorted({d for ds in new_by_source.values() for d in ds})
+
     if not new_dates:
         state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
-        state["last_seen_max_date"] = dates[-1]
+        state["last_seen_max_date"] = max(max(d) for d in found.values())
         return False
 
-    # 열린 날짜들 중 대상 영화 IMAX 회차를 확인한다.
+    # 새 날짜의 회차 정보를 붙인다. 먼저 성공하는 소스를 쓴다(CGV 우선 — 잔여좌석이 나온다).
     lines = []
     for d in new_dates:
-        try:
-            times = target_showtimes(fetch(theater_url(d)))
-        except urllib.error.URLError as e:
-            log(f"{d} 상영시간표 조회 실패: {e}")
-            times = []
+        who = [n for n, ds in new_by_source.items() if d in ds]
+        times: list[str] = []
+        for name, _, get_times in SOURCES:
+            if name not in found:
+                continue
+            try:
+                times = get_times(d)
+            except Exception as e:
+                log(f"{name}: {d} 회차 조회 실패 — {e}")
+                continue
+            if times:
+                break
+        head = f"• {d}  [{'/'.join(who)}]"
         if times:
-            lines.append(f"• {d} — {SCREEN_NAME} {len(times)}회차: {', '.join(times)}")
+            lines.append(f"{head}\n  {SCREEN_NAME} {len(times)}회차\n  "
+                         + "\n  ".join(times))
         else:
-            lines.append(f"• {d} — {MOVIE_NAME} {SCREEN_NAME} 회차 없음(다른 관은 열렸을 수 있음)")
+            lines.append(f"{head}\n  {MOVIE_NAME} {SCREEN_NAME} 회차 없음 "
+                         f"(다른 관은 열렸을 수 있음)")
 
     title = f"🎬 {MOVIE_NAME} 용산 {SCREEN_NAME} 예매 오픈!"
     body = ("CGV 용산아이파크몰 예매가 새로 열렸습니다.\n\n"
@@ -185,21 +282,21 @@ def run_once(state: dict) -> bool:
             + "\n\n지금 바로 예매하세요 →")
     notify(title, body)
 
-    state.setdefault("notified_dates", [])
-    state["notified_dates"] = sorted(set(state["notified_dates"]) | set(new_dates))
+    state["notified_dates"] = sorted(already | set(new_dates))
     state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
-    state["last_seen_max_date"] = dates[-1]
+    state["last_seen_max_date"] = max(max(d) for d in found.values())
     return True
 
 
 def main() -> int:
     if os.environ.get("TEST_NOTIFY") == "1":
-        ok = notify(f"🔔 CGV 감시기 테스트", "알림이 정상 동작합니다. 이 메시지가 보이면 설정 완료!",
+        ok = notify("🔔 CGV 감시기 테스트",
+                    "알림이 정상 동작합니다. 이 메시지가 보이면 설정 완료!",
                     priority="default", tags="white_check_mark")
         return 0 if ok else 1
 
     duration = int(os.environ.get("POLL_SECONDS", "0"))
-    interval = int(os.environ.get("POLL_INTERVAL", "45"))
+    interval = int(os.environ.get("POLL_INTERVAL", "30"))
     deadline = time.monotonic() + duration
 
     state = load_state()
@@ -207,8 +304,6 @@ def main() -> int:
     while True:
         try:
             changed |= run_once(state)
-        except urllib.error.URLError as e:
-            log(f"조회 실패(무시하고 계속): {e}")
         except Exception as e:  # 감시기는 절대 죽지 않는다
             log(f"예상치 못한 오류(무시하고 계속): {e!r}")
 
@@ -220,7 +315,6 @@ def main() -> int:
         save_state(state)
         log("상태 파일 갱신됨")
     else:
-        # 마지막 확인 시각만 갱신해도 커밋이 발생하지 않도록 저장하지 않는다.
         log("변경 없음")
     return 0
 
