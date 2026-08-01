@@ -1,0 +1,60 @@
+name: CGV 용산 IMAX 예매 오픈 감시
+
+on:
+  schedule:
+    # GitHub 크론의 최소 간격은 5분이다. 한 번 실행될 때마다 스크립트가
+    # 약 4분 30초 동안 30초 간격으로 폴링하므로 실효 감시 주기는 30초 수준이다.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "알림 채널만 테스트 (예매 확인 안 함)"
+        type: boolean
+        default: false
+
+# 앞 실행이 끝나기 전에 다음 실행이 겹치면 중복 알림이 가므로 직렬화한다.
+concurrency:
+  group: cgv-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 예매 오픈 확인
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_NOTIFY: ${{ inputs.test_notify && '1' || '0' }}
+          POLL_SECONDS: "270"
+          POLL_INTERVAL: "30"
+          # 감시 대상 — 다른 영화/극장으로 바꾸려면 여기만 수정한다.
+          PLACE_ID: "12298207"      # 네이버 플레이스: CGV 용산아이파크몰
+          WATCH_FROM: "2026-08-19"  # 이 날짜 이후가 열리면 알림
+          MOVIE_NO: "30001323"      # CGV 영화코드: 오디세이
+          MOVIE_NAME: "오디세이"
+          SCREEN_NO: "018"          # 용산 IMAX관
+          SCREEN_NAME: "IMAX"
+        run: python check.py
+
+      - name: 상태 저장 (중복 알림 방지)
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: 감시 상태 갱신 [skip ci]"
+            git push
+          else
+            echo "상태 변경 없음 — 커밋 생략"
+          fi
