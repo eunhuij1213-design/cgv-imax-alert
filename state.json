@@ -1,9 +1,7 @@
 {
   "last_checked": "2026-08-04T13:36:36+09:00",
-  "last_seen_max_date": "2026-08-23",
-  "notified_dates": [
-    "2026-08-23"
-  ],
+  "last_seen_max_date": "2026-08-18",
+  "notified_dates": [],
   "source_status": {
     "CGV": "ok",
     "네이버": "ok"

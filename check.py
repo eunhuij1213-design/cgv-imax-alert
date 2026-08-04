@@ -112,8 +112,12 @@ def cgv_get(endpoint: str, **params) -> list | dict:
     return body.get("data") or []
 
 
-def cgv_open_dates() -> set[str]:
-    """대상 영화가 이 극장에서 예매 가능한 날짜."""
+def cgv_open_dates(skip: frozenset[str] = frozenset()) -> set[str]:
+    """대상 영화가 이 극장에서 예매 가능한 날짜.
+
+    이 엔드포인트는 movNo 로 이미 걸러진 결과를 주므로 날짜별 재확인이 필요 없다.
+    `skip` 은 소스 인터페이스를 맞추기 위한 것이고 여기서는 쓰지 않는다.
+    """
     rows = cgv_get("searchSiteScnscYmdListByMov",
                    coCd=CO_CD, siteNo=SITE_NO, movNo=MOVIE_NO)
     dates = {ymd_to_iso(r["scnYmd"]) for r in rows if r.get("scnYmd")}
@@ -158,9 +162,19 @@ def naver_url(date_iso: str) -> str:
     return f"https://m.place.naver.com/place/{PLACE_ID}/movie?datefilter={date_iso}"
 
 
-def naver_open_dates() -> set[str]:
-    """상단 날짜 탭 = 예매가 열린 날짜."""
-    html = naver_fetch(naver_url(datetime.now(KST).date().isoformat()))
+SHOWTIME_PAT = re.compile(
+    r'href="https://cgv\.co\.kr/cnm/movieBook/movie\?movNo=(\d+)&amp;scnYmd=(\d{8})'
+    r'[^"]*?scnsNo=(\d+)[^"]*"[^>]*>(\d{1,2}:\d{2})<')
+
+
+def naver_parse_times(html: str, *, imax_only: bool) -> list[str]:
+    """페이지에서 대상 영화의 회차 시각을 뽑는다."""
+    return [t for mov, _, scns, t in SHOWTIME_PAT.findall(html)
+            if mov == MOVIE_NO and (not imax_only or scns == SCREEN_NO)]
+
+
+def naver_date_tabs(html: str) -> set[str]:
+    """상단 날짜 탭 = **극장에** 뭐라도 열린 날짜 (영화별이 아니다)."""
     pat = rf"/theater/{PLACE_ID}/movie\?datefilter=(\d{{4}}-\d{{2}}-\d{{2}})"
     dates = set(re.findall(pat, html))
     if not dates:
@@ -168,12 +182,31 @@ def naver_open_dates() -> set[str]:
     return dates
 
 
+def naver_open_dates(skip: frozenset[str] = frozenset()) -> set[str]:
+    """대상 영화가 실제로 상영되는 날짜만 돌려준다.
+
+    날짜 탭은 '극장에 뭐라도 열린 날'이지 '이 영화가 열린 날'이 아니다.
+    실제로 8/23 에 다른 영화(명탐정 코난)만 열렸는데 오디세이 예매 오픈으로
+    오탐 알림이 나갔다. 그래서 탭 날짜는 후보로만 쓰고, 각 날짜 페이지에서
+    대상 영화의 회차가 실제로 있는지 직접 확인한다.
+
+    확인은 날짜마다 요청이 한 번씩 더 드니 알림 대상 구간
+    (WATCH_FROM 이후 & 아직 안 알린 날짜)만 검사한다.
+    """
+    today = datetime.now(KST).date().isoformat()
+    home = naver_fetch(naver_url(today))
+    dates = set()
+    for d in sorted(naver_date_tabs(home)):
+        if d < WATCH_FROM or d in skip:
+            continue
+        html = home if d == today else naver_fetch(naver_url(d))
+        if naver_parse_times(html, imax_only=False):
+            dates.add(d)
+    return dates
+
+
 def naver_showtimes(date_iso: str) -> list[str]:
-    html = naver_fetch(naver_url(date_iso))
-    pat = (r'href="https://cgv\.co\.kr/cnm/movieBook/movie\?movNo=(\d+)&amp;scnYmd=(\d{8})'
-           r'[^"]*?scnsNo=(\d+)[^"]*"[^>]*>(\d{1,2}:\d{2})<')
-    return [t for mov, _, scns, t in re.findall(pat, html)
-            if mov == MOVIE_NO and scns == SCREEN_NO]
+    return naver_parse_times(naver_fetch(naver_url(date_iso)), imax_only=True)
 
 
 # ---------------------------------------------------------------- 알림
@@ -215,14 +248,16 @@ SOURCES = [
 def run_once(state: dict) -> bool:
     """한 번 검사한다. 상태가 바뀌었으면 True."""
     today = datetime.now(KST).date().isoformat()
-    found: dict[str, set[str]] = {}   # 소스명 -> 열린 날짜
+    already = frozenset(state.get("notified_dates", []))
+    found: dict[str, set[str]] = {}   # 소스명 -> 대상 영화가 열린 날짜
     failures: dict[str, str] = {}
 
     for name, list_dates, _ in SOURCES:
         try:
-            dates = list_dates()
+            dates = list_dates(already)
             found[name] = dates
-            log(f"{name}: 예매 가능 {len(dates)}건 (최대 {max(dates)})")
+            span = f" (최대 {max(dates)})" if dates else ""
+            log(f"{name}: {MOVIE_NAME} 예매 가능 {len(dates)}건{span}")
         except Exception as e:
             failures[name] = str(e)
             log(f"{name}: 조회 실패 — {e}")
@@ -243,14 +278,15 @@ def run_once(state: dict) -> bool:
     state["source_status"] = {name: ("ok" if name in found else failures.get(name, "fail"))
                               for name, _, _ in SOURCES}
 
-    already = set(state.get("notified_dates", []))
     new_by_source = {name: sorted(d for d in dates if d >= WATCH_FROM and d not in already)
                      for name, dates in found.items()}
     new_dates = sorted({d for ds in new_by_source.values() for d in ds})
+    seen_max = max((max(d) for d in found.values() if d), default=None)
 
     if not new_dates:
         state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
-        state["last_seen_max_date"] = max(max(d) for d in found.values())
+        if seen_max:
+            state["last_seen_max_date"] = seen_max
         return False
 
     # 새 날짜의 회차 정보를 붙인다. 먼저 성공하는 소스를 쓴다(CGV 우선 — 잔여좌석이 나온다).
@@ -270,21 +306,22 @@ def run_once(state: dict) -> bool:
                 break
         head = f"• {d}  [{'/'.join(who)}]"
         if times:
-            lines.append(f"{head}\n  {SCREEN_NAME} {len(times)}회차\n  "
+            lines.append(f"{head}\n  {MOVIE_NAME} {SCREEN_NAME} {len(times)}회차\n  "
                          + "\n  ".join(times))
         else:
-            lines.append(f"{head}\n  {MOVIE_NAME} {SCREEN_NAME} 회차 없음 "
-                         f"(다른 관은 열렸을 수 있음)")
+            # 영화가 열린 건 확인됐지만 대상 상영관 회차만 아직 없는 경우.
+            lines.append(f"{head}\n  {MOVIE_NAME} 상영은 열렸으나 {SCREEN_NAME} 회차 없음")
 
     title = f"🎬 {MOVIE_NAME} 용산 {SCREEN_NAME} 예매 오픈!"
-    body = ("CGV 용산아이파크몰 예매가 새로 열렸습니다.\n\n"
+    body = (f"CGV 용산아이파크몰 {MOVIE_NAME} 예매가 새로 열렸습니다.\n\n"
             + "\n".join(lines)
             + "\n\n지금 바로 예매하세요 →")
     notify(title, body)
 
-    state["notified_dates"] = sorted(already | set(new_dates))
+    state["notified_dates"] = sorted(set(already) | set(new_dates))
     state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
-    state["last_seen_max_date"] = max(max(d) for d in found.values())
+    if seen_max:
+        state["last_seen_max_date"] = seen_max
     return True
 
 
